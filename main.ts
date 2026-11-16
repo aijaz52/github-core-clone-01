@@ -1,91 +1,93 @@
 import { createApp } from './app.ts';
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (ENV_URL === '') {
-  process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
-  process.exit(1);
-}
+// Only the environment decides when a run has finished. Until then, keep serving.
+const registrationBudget = 20_000;
+const requestBudget = 5_000;
+const pause = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+const backoff = (failures: number) => Math.min(2_000, 250 * 2 ** Math.min(failures, 4));
 
-/** How long one register or done request may take before it is abandoned and retried. */
-const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
-const RETRY_INITIAL_MS = 250;
-const RETRY_MAX_MS = 2_000;
+async function announce(origin: string, port: number): Promise<void> {
+  const deadline = performance.now() + registrationBudget;
+  let failures = 0;
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
-function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
-}
-
-/**
- * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
- * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
- * a network error or another status is retried, since the env may still be starting.
- */
-async function register(port: number): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+  while (performance.now() < deadline) {
+    let status: number | undefined;
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
+      const response = await fetch(`${origin}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(requestBudget, deadline - performance.now())))),
       });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+      status = response.status;
+      await response.body?.cancel();
+    } catch {
+      // Startup races and temporary connection failures share the same retry path.
     }
-    await sleep(retryDelay(attempt));
+
+    if (status === 200 || status === 409) return;
+    if (status === 400 || status === 405) {
+      throw new Error(`registration rejected with HTTP ${status}`);
+    }
+    const remaining = deadline - performance.now();
+    if (remaining > 0) await pause(Math.min(backoff(failures++), remaining));
   }
+  throw new Error('registration did not succeed within 20 seconds');
 }
 
-/** Poll GET /done until it answers {"done":true}; never return before that. */
-async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+async function followRun(origin: string): Promise<void> {
+  let failures = 0;
+  for (;;) {
     try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
+      const response = await fetch(`${origin}/done`, {
+        signal: AbortSignal.timeout(requestBudget),
+      });
+      if (response.ok) {
+        const result: unknown = await response.json();
+        if (result !== null && typeof result === 'object' && 'done' in result && result.done === true) return;
+      } else {
+        await response.body?.cancel();
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      // A failed poll supplies no completion signal; leave the application running.
     }
-    await sleep(retryDelay(attempt));
+    await pause(backoff(failures++));
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
-  });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+async function run(): Promise<void> {
+  const origin = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+  if (!origin) throw new Error('MAKEFUN_ENV_URL is not set');
 
-  await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
-
-  await waitForDone();
+  const application = createApp();
   await new Promise<void>((resolve, reject) => {
-    server.close((err) => {
-      if (err) reject(err);
-      else resolve();
+    application.once('error', reject);
+    // Let the OS choose the application's TCP port.
+    application.listen(0, () => {
+      application.off('error', reject);
+      resolve();
     });
   });
+
+  try {
+    const binding = application.address();
+    if (!binding || typeof binding === 'string') throw new Error('no TCP port was assigned');
+    process.stdout.write(`[entry] listening on port ${binding.port}\n`);
+    await announce(origin, binding.port);
+    process.stdout.write('[entry] registered; awaiting completion\n');
+    await followRun(origin);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      application.close((error) => error ? reject(error) : resolve());
+    });
+  }
   process.stdout.write('[entry] done\n');
 }
 
 try {
-  await main();
+  await run();
   process.exit(0);
-} catch (err) {
-  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
+} catch (error) {
+  process.stderr.write(`[entry] ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 }
