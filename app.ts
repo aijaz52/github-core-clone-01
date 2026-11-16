@@ -16,11 +16,28 @@ interface Repo {
   pulls: Map<number, Json>;
   comments: Map<number, Json[]>;
   nextNumber: number;
+  uploadCache: Map<string, Buffer>;
+  uploadFlights: Map<string, Promise<Buffer>>;
+  gitRevision: number;
 }
 const ZERO = '0'.repeat(40);
 const FLUSH = Buffer.from('0000');
 const EMPTY = Buffer.alloc(0);
 const DELIM = Buffer.from('0001');
+const GIT_ROUTE = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+const REPO_ROUTE = /^repos\/([^/]+)\/([^/]+)(?:\/(.*))?$/;
+const ITEM_ROUTE = /^(issues|pulls)\/(\d+)(?:\/(comments|files|merge))?$/;
+const API_PREFIX = /^\/api\/v3\/?/;
+const TRAILING_SLASH = /\/$/;
+const PACKET_HEX = /^[a-f0-9]{4}$/i;
+const TRAILING_NEWLINE = /\n$/;
+const OBJECT_ID = /^[a-f0-9]{40}$/;
+const TAG_TARGET = /^object ([a-f0-9]{40})/m;
+const REPO_NAME = /^[\w.-]+$/;
+const UPLOAD_CACHE_LIMIT = 8;
+// Immutable length headers can be copied into packets without sharing writable output.
+const PACKET_HEADERS = Buffer.allocUnsafe(65521 * 4);
+for (let n = 0; n <= 65520; n++) PACKET_HEADERS.write(n.toString(16).padStart(4, '0'), n * 4, 4, 'ascii');
 const TYPES: ObjectType[] = ['commit', 'tree', 'blob', 'tag'];
 const NOW = process.env.MAKEFUN_TRIAL_NOW || '2026-01-01T00:00:00Z';
 // The wire contract's token account; deployments may choose their own account login.
@@ -35,9 +52,14 @@ function requireValue(ok: unknown, status: number, message: string): asserts ok 
   if (!ok) throw new HttpError(status, message);
 }
 function sha(data: Buffer): Buffer { return createHash('sha1').update(data).digest(); }
+function invalidateGit(repo: Repo): void {
+  repo.gitRevision++;
+  repo.uploadCache.clear();
+}
 function put(repo: Repo, type: ObjectType, data: Buffer): string {
   const oid = createHash('sha1').update(`${type} ${data.length}\0`).update(data).digest('hex');
   repo.objects.set(oid, { type, data });
+  invalidateGit(repo);
   return oid;
 }
 function object(repo: Repo, oid: string): GitObject {
@@ -136,7 +158,7 @@ function reachable(repo: Repo, roots: string[], depth = Infinity, boundaries = n
     } else if (obj.type === 'tree') {
       queue.push(...treeEntries(obj.data).filter(e => e.mode !== '160000').map(e => [e.oid, generation] as [string, number]));
     } else if (obj.type === 'tag') {
-      const target = /^object ([a-f0-9]{40})/m.exec(obj.data.toString())?.[1];
+      const target = TAG_TARGET.exec(obj.data.toString())?.[1];
       if (target) queue.push([target, generation]);
     }
   }
@@ -144,27 +166,37 @@ function reachable(repo: Repo, roots: string[], depth = Infinity, boundaries = n
 }
 
 function pkt(data: string | Buffer): Buffer {
-  const bytes = typeof data === 'string' ? Buffer.from(data) : data;
-  requireValue(bytes.length <= 65516, 400, 'Packet too large');
-  return Buffer.concat([Buffer.from((bytes.length + 4).toString(16).padStart(4, '0')), bytes]);
+  const length = typeof data === 'string' ? Buffer.byteLength(data) : data.length;
+  requireValue(length <= 65516, 400, 'Packet too large');
+  const out = Buffer.allocUnsafe(length + 4);
+  PACKET_HEADERS.copy(out, 0, (length + 4) * 4, (length + 5) * 4);
+  if (typeof data === 'string') out.write(data, 4); else data.copy(out, 4);
+  return out;
 }
 function packets(data: Buffer, stopAtFlush = false): { lines: string[]; offset: number } {
   const lines: string[] = [];
   let at = 0;
   while (at < data.length) {
-    requireValue(at + 4 <= data.length && /^[a-f0-9]{4}$/i.test(data.toString('ascii', at, at + 4)), 400, 'Invalid pkt-line');
-    const n = parseInt(data.toString('ascii', at, at + 4), 16);
+    const header = data.toString('ascii', at, at + 4);
+    requireValue(at + 4 <= data.length && PACKET_HEX.test(header), 400, 'Invalid pkt-line');
+    const n = parseInt(header, 16);
     at += 4;
     if (n <= 2) { if (n === 0 && stopAtFlush) break; continue; }
     requireValue(n >= 4 && n <= 65520 && at + n - 4 <= data.length, 400, 'Truncated pkt-line');
-    lines.push(data.toString('utf8', at, at + n - 4).replace(/\n$/, ''));
+    lines.push(data.toString('utf8', at, at + n - 4).replace(TRAILING_NEWLINE, ''));
     at += n - 4;
   }
   return { lines, offset: at };
 }
 function sideband(data: Buffer): Buffer[] {
   const result: Buffer[] = [];
-  for (let at = 0; at < data.length; at += 65515) result.push(pkt(Buffer.concat([Buffer.from([1]), data.subarray(at, at + 65515)])));
+  for (let at = 0; at < data.length; at += 65515) {
+    const length = Math.min(65515, data.length - at), out = Buffer.allocUnsafe(length + 5);
+    PACKET_HEADERS.copy(out, 0, (length + 5) * 4, (length + 6) * 4);
+    out[4] = 1;
+    data.copy(out, 5, at, at + length);
+    result.push(out);
+  }
   return result;
 }
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -268,23 +300,25 @@ function peeled(repo: Repo, oid: string): string | undefined {
   let obj = repo.objects.get(oid), target: string | undefined;
   const seen = new Set<string>();
   while (obj?.type === 'tag' && !seen.has(oid)) {
-    seen.add(oid); target = /^object ([a-f0-9]{40})/m.exec(obj.data.toString())?.[1];
+    seen.add(oid); target = TAG_TARGET.exec(obj.data.toString())?.[1];
     if (!target) break;
     oid = target; obj = repo.objects.get(oid);
   }
   return target;
 }
-function gitResponse(req: IncomingMessage, res: ServerResponse, repo: Repo, service: string, advertise: boolean, body: Buffer): void {
+function sortedRefs(repo: Repo, head?: string): [string, string][] {
+  return [...(head ? [['HEAD', head] as [string, string]] : []), ...repo.refs.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+}
+function gitData(req: IncomingMessage, repo: Repo, service: string, advertise: boolean, body: Buffer): Buffer {
   const upload = service === 'git-upload-pack', v2 = upload && String(req.headers['git-protocol']).includes('version=2');
   let output: Buffer[] = [];
   const headRef = `refs/heads/${repo.info.default_branch}`, head = repo.refs.get(headRef);
-  const refs = [...(head ? [['HEAD', head] as [string, string]] : []), ...repo.refs.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   if (advertise) {
     if (v2) output = [pkt('version 2\n'), pkt('agent=memory-forge/1.0\n'), pkt('ls-refs=unborn\n'), pkt('fetch=shallow\n'), pkt('object-format=sha1\n'), FLUSH];
     else {
       const caps = upload ? `side-band-64k ofs-delta shallow no-progress symref=HEAD:${headRef} agent=memory-forge/1.0` : 'report-status side-band-64k delete-refs ofs-delta agent=memory-forge/1.0';
       output = [pkt(`# service=${service}\n`), FLUSH];
-      const advertised = refs.length ? refs : [['capabilities^{}', ZERO]];
+      const refs = sortedRefs(repo, head), advertised = refs.length ? refs : [['capabilities^{}', ZERO]];
       advertised.forEach(([name, oid], i) => {
         output.push(pkt(`${oid} ${name}${i === 0 ? '\0' + caps : ''}\n`));
         const target = peeled(repo, oid);
@@ -293,6 +327,7 @@ function gitResponse(req: IncomingMessage, res: ServerResponse, repo: Repo, serv
       output.push(FLUSH);
     }
   } else if (!upload) {
+    invalidateGit(repo);
     const commands = packets(body, true);
     let unpack = 'ok';
     try {
@@ -302,7 +337,7 @@ function gitResponse(req: IncomingMessage, res: ServerResponse, repo: Repo, serv
     for (const line of commands.lines) {
       const [old, next, ref] = line.split('\0')[0].trim().split(' ');
       let reason = unpack === 'ok' ? '' : 'unpacker error';
-      if (!ref?.startsWith('refs/') || !/^[a-f0-9]{40}$/.test(next || '')) reason ||= 'invalid ref';
+      if (!ref?.startsWith('refs/') || !OBJECT_ID.test(next || '')) reason ||= 'invalid ref';
       else if ((repo.refs.get(ref) || ZERO) !== old) reason ||= 'stale ref';
       else if (next !== ZERO && !repo.objects.has(next)) reason ||= 'missing object';
       else if (old !== ZERO && next !== ZERO && !hasAncestor(repo, next, old)) reason ||= 'non-fast-forward';
@@ -315,7 +350,7 @@ function gitResponse(req: IncomingMessage, res: ServerResponse, repo: Repo, serv
     const { lines } = packets(body);
     if (v2 && lines.includes('command=ls-refs')) {
       const prefixes = lines.filter(s => s.startsWith('ref-prefix ')).map(s => s.slice(11));
-      for (const [name, oid] of refs) {
+      for (const [name, oid] of sortedRefs(repo, head)) {
         if (prefixes.length && !prefixes.some(p => name.startsWith(p))) continue;
         const target = lines.includes('peel') ? peeled(repo, oid) : undefined;
         output.push(pkt(`${oid} ${name}${name === 'HEAD' && lines.includes('symrefs') ? ' symref-target:' + headRef : ''}${target ? ' peeled:' + target : ''}\n`));
@@ -342,9 +377,35 @@ function gitResponse(req: IncomingMessage, res: ServerResponse, repo: Repo, serv
       output.push(...sideband(writePack(repo, wanted.ids)), FLUSH);
     }
   }
-  const data = Buffer.concat(output);
+  return Buffer.concat(output);
+}
+function sendGit(res: ServerResponse, service: string, advertise: boolean, data: Buffer): void {
   res.writeHead(200, { 'content-type': `application/x-${service}-${advertise ? 'advertisement' : 'result'}`, 'content-length': data.length, 'cache-control': 'no-cache' });
   res.end(data);
+}
+function gitResponse(req: IncomingMessage, res: ServerResponse, repo: Repo, service: string, advertise: boolean, body: Buffer, onError: (err: unknown) => void): void {
+  if (service !== 'git-upload-pack') return sendGit(res, service, advertise, gitData(req, repo, service, advertise, body));
+  // Repository identity is implicit in these maps. The exact request includes wants,
+  // depth, haves and capabilities, so different negotiations never share a result.
+  const revision = repo.gitRevision;
+  const key = `${revision}:${String(req.headers['git-protocol']).includes('version=2') ? 2 : 0}:${advertise ? 'advertisement' : body.toString('base64')}`;
+  const cached = repo.uploadCache.get(key);
+  if (cached) {
+    repo.uploadCache.delete(key); repo.uploadCache.set(key, cached);
+    return sendGit(res, service, advertise, cached);
+  }
+  let flight = repo.uploadFlights.get(key);
+  if (!flight) {
+    flight = Promise.resolve().then(() => gitData(req, repo, service, advertise, body)).then(data => {
+      if (repo.gitRevision === revision) {
+        if (repo.uploadCache.size >= UPLOAD_CACHE_LIMIT) repo.uploadCache.delete(repo.uploadCache.keys().next().value!);
+        repo.uploadCache.set(key, data);
+      }
+      return data;
+    }).finally(() => { repo.uploadFlights.delete(key); });
+    repo.uploadFlights.set(key, flight);
+  }
+  void flight.then(data => sendGit(res, service, advertise, data)).catch(onError);
 }
 
 function mergeData(repo: Repo, pull: Json): { entries: Map<string, FileEntry>; conflict: boolean } {
@@ -469,13 +530,15 @@ const MCP_TOOLS = [
 /** Each server owns an independent in-memory forge; importing this module binds no port. */
 export function createApp(): Server {
   const repos = new Map<string, Repo>();
-  // Bodies belong to mutable items; routes only cache lookup results, never responses or auth.
-  const itemBodies = new WeakMap<Json, { data: string; length: number }>();
+  // Serialized bodies belong to items; authentication and request IDs stay per request.
+  const itemBodies = new WeakMap<Json, Buffer>();
   const itemRoutes = new Map<string, Json>();
   const creationRoutes = new Map<string, Repo>();
   let nextId = 5000, requestId = 0;
-  function sendData(res: ServerResponse, status: number, data: string, headers?: Record<string, string>, length = Buffer.byteLength(data)): void {
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': length, 'x-github-request-id': (++requestId).toString(16).padStart(12, '0'), ...headers });
+  function sendData(res: ServerResponse, status: number, data: string | Buffer, headers?: Record<string, string>, length = typeof data === 'string' ? Buffer.byteLength(data) : data.length): void {
+    const id = (++requestId).toString(16).padStart(12, '0');
+    if (headers) res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': length, 'x-github-request-id': id, ...headers });
+    else res.writeHead(status, ['content-type', 'application/json; charset=utf-8', 'content-length', String(length), 'x-github-request-id', id]);
     res.end(data);
   }
   function send(res: ServerResponse, status: number, body: unknown, headers?: Record<string, string>): void {
@@ -484,22 +547,21 @@ export function createApp(): Server {
   function sendItem(res: ServerResponse, status: number, item: Json): void {
     let cached = itemBodies.get(item);
     if (!cached) {
-      const data = JSON.stringify(item) + '\n';
-      cached = { data, length: Buffer.byteLength(data) }; itemBodies.set(item, cached);
+      cached = Buffer.from(JSON.stringify(item) + '\n'); itemBodies.set(item, cached);
     }
-    sendData(res, status, cached.data, undefined, cached.length);
+    sendData(res, status, cached, undefined, cached.length);
   }
   function content(repo: Repo, path: string, entry: FileEntry): Json {
     const data = object(repo, entry.oid).data;
     return { type: 'file', name: path.split('/').pop(), path, sha: entry.oid, size: data.length, encoding: 'base64', content: data.toString('base64') };
   }
   function createRepo(body: Json, origin: string): Repo {
-    requireValue(typeof body.name === 'string' && /^[\w.-]+$/.test(body.name), 422, 'Invalid repository name');
+    requireValue(typeof body.name === 'string' && REPO_NAME.test(body.name), 422, 'Invalid repository name');
     const key = `${LOGIN}/${body.name}`;
     requireValue(!repos.has(key), 422, 'Repository already exists');
     const id = nextId++;
     const info = { id, node_id: `R_${id}`, name: body.name, full_name: key, owner: user, private: !!body.private, description: body.description || '', default_branch: body.default_branch || 'main', created_at: NOW, updated_at: NOW, clone_url: `${origin}/${key}.git`, url: `${origin}/api/v3/repos/${key}` };
-    const repo: Repo = { info, objects: new Map(), refs: new Map(), labels: new Map(), issues: new Map(), pulls: new Map(), comments: new Map(), nextNumber: 1 };
+    const repo: Repo = { info, objects: new Map(), refs: new Map(), labels: new Map(), issues: new Map(), pulls: new Map(), comments: new Map(), nextNumber: 1, uploadCache: new Map(), uploadFlights: new Map(), gitRevision: 0 };
     repos.set(key, repo);
     if (body.auto_init) repo.refs.set(`refs/heads/${info.default_branch}`, commit(repo, new Map(), [], 'Initial commit'));
     return repo;
@@ -675,13 +737,13 @@ export function createApp(): Server {
       if (path === '/healthz' && method === 'GET') return send(res, 200, { ok: true });
       const api = path === '/api' || path.startsWith('/api/'), mcp = path === '/mcp' || path.startsWith('/mcp/');
       if (api || mcp) requireValue(process.env.MAKEFUN_SHOP_TOKEN && req.headers.authorization === `Bearer ${process.env.MAKEFUN_SHOP_TOKEN}`, 401, 'Bad credentials');
-      const git = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+      const git = GIT_ROUTE.exec(path);
       if (git) {
         const repo = repos.get(`${git[1]}/${git[2]}`);
         requireValue(repo, 404, 'Not Found');
         const advertise = git[3] === 'info/refs', service = advertise ? url.searchParams.get('service') : git[3];
         requireValue((service === 'git-upload-pack' || service === 'git-receive-pack') && method === (advertise ? 'GET' : 'POST'), 404, 'Not Found');
-        return gitResponse(req, res, repo, service, advertise, raw);
+        return gitResponse(req, res, repo, service, advertise, raw, err => sendError(res, err));
       }
       let body: Json = {};
       if (raw.length) { try { body = JSON.parse(raw.toString()); } catch {
@@ -695,7 +757,7 @@ export function createApp(): Server {
         return send(res, 200, response);
       }
       requireValue(body && typeof body === 'object' && !Array.isArray(body), 400, 'Expected a JSON object');
-      const route = path.replace(/^\/api\/v3\/?/, '').replace(/\/$/, '');
+      const route = path.replace(API_PREFIX, '').replace(TRAILING_SLASH, '');
       if (!path.startsWith('/api/v3')) return send(res, 404, { message: 'Not Found' });
       const page = <T>(list: T[]): void => {
         const size = Math.min(100, Math.max(1, Number(url.searchParams.get('per_page')) || 30)), n = Math.max(1, Number(url.searchParams.get('page')) || 1);
@@ -712,18 +774,18 @@ export function createApp(): Server {
           return send(res, 201, createRepo(body, url.origin).info);
         }
       }
-      const match = /^repos\/([^/]+)\/([^/]+)(?:\/(.*))?$/.exec(route);
+      const match = REPO_ROUTE.exec(route);
       requireValue(match, 404, 'Not Found');
       const key = `${match[1]}/${match[2]}`, repo = repos.get(key), tail = match[3] || '';
       requireValue(repo, 404, 'Not Found');
       if (!tail) {
-        if (method === 'GET') return send(res, 200, repo.info);
-        if (method === 'PATCH') { for (const field of ['description', 'default_branch', 'private']) if (field in body) repo.info[field] = body[field]; return send(res, 200, repo.info); }
+        if (method === 'GET') return sendItem(res, 200, repo.info);
+        if (method === 'PATCH') { for (const field of ['description', 'default_branch', 'private']) if (field in body) repo.info[field] = body[field]; itemBodies.delete(repo.info); invalidateGit(repo); return sendItem(res, 200, repo.info); }
         if (method === 'DELETE') { repos.delete(key); itemRoutes.clear(); creationRoutes.clear(); return send(res, 204, null); }
       }
       if (tail === 'git/refs' && method === 'POST') {
         requireValue(typeof body.ref === 'string' && body.ref.startsWith('refs/') && repo.objects.has(body.sha) && !repo.refs.has(body.ref), 422, 'Invalid reference');
-        repo.refs.set(body.ref, body.sha); return send(res, 201, { ref: body.ref, object: { type: object(repo, body.sha).type, sha: body.sha } });
+        repo.refs.set(body.ref, body.sha); invalidateGit(repo); return send(res, 201, { ref: body.ref, object: { type: object(repo, body.sha).type, sha: body.sha } });
       }
       if (tail.startsWith('git/refs/') && method === 'GET') {
         const ref = tail.slice(9), oid = repo.refs.get('refs/' + ref);
@@ -772,7 +834,7 @@ export function createApp(): Server {
           return sendItem(res, 201, item);
         }
       }
-      const itemMatch = /^(issues|pulls)\/(\d+)(?:\/(comments|files|merge))?$/.exec(tail);
+      const itemMatch = ITEM_ROUTE.exec(tail);
       if (itemMatch) {
         const number = Number(itemMatch[2]), isPull = itemMatch[1] === 'pulls', item = (isPull ? repo.pulls : repo.issues).get(number), action = itemMatch[3];
         requireValue(item, 404, 'Not Found');
@@ -790,8 +852,11 @@ export function createApp(): Server {
       }
       send(res, 404, { message: 'Not Found' });
     } catch (err) {
-      send(res, err instanceof HttpError ? err.status : 400, { message: err instanceof Error ? err.message : 'Bad request' });
+      sendError(res, err);
     }
+  }
+  function sendError(res: ServerResponse, err: unknown): void {
+    send(res, err instanceof HttpError ? err.status : 400, { message: err instanceof Error ? err.message : 'Bad request' });
   }
   return createServer((req, res) => {
     // Empty requests can dispatch immediately; body-bearing requests retain their original buffers.
